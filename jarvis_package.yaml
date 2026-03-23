@@ -1,0 +1,21 @@
+name: "get_news"
+display_name: "News Headlines"
+description: "Get the latest news headlines by category via RSS feeds. Supports general, tech, sports, business, science, and health. Includes background agent for new article alerts."
+version: "1.1.0"
+min_jarvis_version: "0.9.0"
+license: "MIT"
+author:
+  github: "alexberardi"
+categories: ["information", "news"]
+platforms: ["darwin", "linux"]
+keywords: ["news", "headlines", "rss", "briefing", "current events", "alerts"]
+
+packages:
+  - name: feedparser
+
+secrets:
+  - key: NEWS_RSS_FEEDS
+    scope: integration
+    value_type: string
+    description: "Comma-separated custom RSS feed URLs (optional, merged with built-in feeds)"
+    is_sensitive: false
