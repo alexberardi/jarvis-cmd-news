@@ -10,6 +10,14 @@ categories: ["information", "news"]
 platforms: ["darwin", "linux"]
 keywords: ["news", "headlines", "rss", "briefing", "current events", "alerts"]
 
+components:
+  - type: command
+    name: get_news
+    path: commands/get_news/command.py
+  - type: agent
+    name: news_alerts
+    path: agents/news_alerts/agent.py
+
 packages:
   - name: feedparser
 
