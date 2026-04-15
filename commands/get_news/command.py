@@ -34,11 +34,7 @@ from jarvis_command_sdk import (
     RequestInformation,
 )
 
-try:
-    from services.secret_service import get_secret_value
-except ImportError:
-    def get_secret_value(key: str, scope: str) -> str | None:
-        return None
+# Secrets arrive via the SDK's execute() wrapper — see run() below.
 
 logger = JarvisLogger(service="jarvis-node")
 
@@ -147,14 +143,20 @@ class NewsCommand(IJarvisCommand):
     # Execution
     # ------------------------------------------------------------------
 
-    def run(self, request_info: RequestInformation, **kwargs: Any) -> CommandResponse:
+    def run(
+        self,
+        request_info: RequestInformation,
+        *,
+        secrets: Dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> CommandResponse:
         category: str = kwargs.get("category", "general")
         count: int = kwargs.get("count", 5)
 
         feed_urls = list(_DEFAULT_FEEDS.get(category, _DEFAULT_FEEDS["general"]))
 
-        # Merge custom feeds from secret
-        custom = get_secret_value("NEWS_RSS_FEEDS", "integration")
+        # Merge custom feeds from secret (host passes them via the SDK wrapper)
+        custom = (secrets or {}).get("NEWS_RSS_FEEDS")
         if custom:
             for url in custom.split(","):
                 url = url.strip()
