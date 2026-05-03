@@ -102,8 +102,6 @@ class NewsAlertAgent(IJarvisAgent):
                         source_agent=self.name,
                         title=title,
                         summary=article.get("summary", "")[:200],
-                        created_at=now,
-                        expires_at=now + timedelta(hours=ALERT_TTL_HOURS),
                         priority=1,
                     ))
 
