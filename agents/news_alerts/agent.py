@@ -29,7 +29,7 @@ from jarvis_command_sdk import IJarvisSecret
 
 logger = JarvisLogger(service="jarvis-node")
 
-REFRESH_INTERVAL_SECONDS = 60  # TEMP: 60s for testing (prod: 1800)
+REFRESH_INTERVAL_SECONDS = 1800  # 30 minutes
 ALERT_TTL_HOURS = 4
 MEMORY_TTL_HOURS = 24
 
