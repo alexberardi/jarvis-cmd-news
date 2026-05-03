@@ -2,8 +2,12 @@
 
 Runs every 30 minutes. Compares against previous run's titles to detect new
 articles. Alerts have a 4-hour TTL and low priority (1).
+
+Also injects headlines into the command center's memory system so Jarvis has
+proactive awareness of current events during voice conversations.
 """
 
+import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
@@ -27,6 +31,7 @@ logger = JarvisLogger(service="jarvis-node")
 
 REFRESH_INTERVAL_SECONDS = 1800  # 30 minutes
 ALERT_TTL_HOURS = 4
+MEMORY_TTL_HOURS = 24
 
 
 class NewsAlertAgent(IJarvisAgent):
@@ -61,7 +66,7 @@ class NewsAlertAgent(IJarvisAgent):
         return False
 
     async def run(self) -> None:
-        """Fetch news and detect new articles since last run."""
+        """Fetch news, detect new articles, and inject into CC memory."""
         try:
             # Import from this package's command
             try:
@@ -81,6 +86,8 @@ class NewsAlertAgent(IJarvisAgent):
                 self._current_articles = articles
                 logger.info("News agent seeded", article_count=len(articles))
                 self._alerts = []
+                # Still inject into memory on first run
+                self._inject_memories(articles)
                 return
 
             # Detect new articles
@@ -106,9 +113,55 @@ class NewsAlertAgent(IJarvisAgent):
             if self._alerts:
                 logger.info("News agent found new articles", count=len(self._alerts))
 
+            # Inject all current headlines into CC memory
+            self._inject_memories(articles)
+
         except Exception as e:
             logger.error("News agent run failed", error=str(e))
             self._alerts = []
+
+    def _inject_memories(self, articles: List[Dict[str, Any]]) -> None:
+        """Push article headlines into CC memory system for proactive context."""
+        try:
+            from clients.rest_client import RestClient
+        except ImportError:
+            logger.debug("RestClient not available — skipping memory injection")
+            return
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        memories = []
+
+        for article in articles:
+            title = article.get("title", "").strip()
+            if not title:
+                continue
+
+            source = article.get("source", "")
+            summary = article.get("summary", "")
+
+            content = title
+            if summary:
+                clean = summary[:200].strip()
+                if clean and clean != title:
+                    content = f"{title} — {clean}"
+
+            title_hash = hashlib.md5(title.lower().encode()).hexdigest()[:8]
+
+            memories.append({
+                "content": content,
+                "category": "news",
+                "key": f"news:general:{today}:{title_hash}",
+                "ttl_hours": MEMORY_TTL_HOURS,
+                "source": f"news-agent:{source}",
+            })
+
+        if memories:
+            result = RestClient.inject_memories(memories)
+            if result:
+                logger.info(
+                    "News agent injected memories",
+                    count=result.get("injected", 0) + result.get("updated", 0),
+                )
 
     def get_context_data(self) -> Dict[str, Any]:
         return {}
