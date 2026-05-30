@@ -43,6 +43,25 @@ _SPOKEN_NUMBERS: dict[str, int] = {
     "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
 }
 
+
+def _compose_news_message(articles: List[Dict[str, Any]], category: str) -> str:
+    """Build a spoken summary for the pre-route fast path.
+
+    Reads the top-3 titles aloud — short enough for TTS to play without
+    feeling like a wall of text. Falls back gracefully when titles are
+    short or missing.
+    """
+    if not articles:
+        return "I couldn't find any news headlines."
+    cat_phrase = "" if category == "general" else f"{category} "
+    titles = [a.get("title", "").strip() for a in articles[:3] if a.get("title")]
+    if not titles:
+        return f"Here's the {cat_phrase}news, but no headline text was available."
+    if len(titles) == 1:
+        return f"Top {cat_phrase}headline: {titles[0]}."
+    parts = ". ".join(f"{i + 1}. {t}" for i, t in enumerate(titles))
+    return f"Top {len(titles)} {cat_phrase}headlines. {parts}."
+
 # Secrets arrive via the SDK's execute() wrapper — see run() below.
 
 logger = JarvisLogger(service="jarvis-node")
@@ -277,12 +296,20 @@ class NewsCommand(IJarvisCommand):
 
         articles = articles[:count]
 
+        context_data: Dict[str, Any] = {
+            "category": category,
+            "count": len(articles),
+            "articles": articles,
+        }
+        # Pre-route callers have no LLM downstream — pre-compose a spoken
+        # summary from the headlines. Without this, the wrapper sees no
+        # `message` and falls through to the LLM path, defeating the
+        # fast-path entirely (see command_execution_service.py:914-922).
+        if request_info.is_pre_routed:
+            context_data["message"] = _compose_news_message(articles, category)
+
         return CommandResponse.success_response(
-            context_data={
-                "category": category,
-                "count": len(articles),
-                "articles": articles,
-            },
+            context_data=context_data,
             wait_for_input=False,
         )
 
