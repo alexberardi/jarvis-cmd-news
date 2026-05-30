@@ -25,14 +25,23 @@ except ImportError:
 from jarvis_command_sdk import (
     CommandExample,
     CommandResponse,
+    FastPathPattern,
     IJarvisCommand,
     JarvisPackage,
     JarvisParameter,
     IJarvisParameter,
     IJarvisSecret,
     JarvisSecret,
+    PreRouteResult,
     RequestInformation,
 )
+
+# Spoken word number → int. The LLM normally handles this; for pre-route we
+# only support common small counts so "top three headlines" routes deterministically.
+_SPOKEN_NUMBERS: dict[str, int] = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
 
 # Secrets arrive via the SDK's execute() wrapper — see run() below.
 
@@ -138,6 +147,102 @@ class NewsCommand(IJarvisCommand):
 
     def generate_adapter_examples(self) -> List[CommandExample]:
         return self.generate_prompt_examples()
+
+    # ------------------------------------------------------------------
+    # Fast-path patterns — bypass the LLM for the common shapes.
+    # ------------------------------------------------------------------
+
+    @property
+    def fast_path_patterns(self) -> List[FastPathPattern]:
+        # Build a regex that captures category and/or count. Categories are
+        # a fixed enum, so the alternation is safe. The order is descending
+        # specificity: most-specific (count + category) first, then count
+        # alone, then category alone, then bare news request.
+        cat_group = r"(?P<category>" + "|".join(_CATEGORIES) + r")"
+        return [
+            FastPathPattern(
+                id="get_news.top_n_category",
+                description="Bypass LLM for 'top N <category> headlines/news'",
+                example="top 3 tech headlines",
+                regex=(
+                    r"^\s*(?:top\s+|give\s+me\s+(?:the\s+)?top\s+|read\s+(?:me\s+)?(?:the\s+)?top\s+)"
+                    r"(?P<count>\d+|" + "|".join(_SPOKEN_NUMBERS) + r")\s+"
+                    + cat_group + r"\s+(?:news|headlines?|stories)"
+                    r"\s*[?.!]*$"
+                ),
+                handler="_fp_count_category",
+            ),
+            FastPathPattern(
+                id="get_news.top_n",
+                description="Bypass LLM for 'top N headlines/news' (no category)",
+                example="top 3 headlines",
+                regex=(
+                    r"^\s*(?:top\s+|give\s+me\s+(?:the\s+)?top\s+|read\s+(?:me\s+)?(?:the\s+)?top\s+)"
+                    r"(?P<count>\d+|" + "|".join(_SPOKEN_NUMBERS) + r")\s+"
+                    r"(?:headlines?|news|stories)"
+                    r"\s*[?.!]*$"
+                ),
+                handler="_fp_count_only",
+            ),
+            FastPathPattern(
+                id="get_news.category",
+                description="Bypass LLM for category-only news ('any tech news', 'give me sports headlines')",
+                example="any tech news",
+                regex=(
+                    r"^\s*(?:any\s+|give\s+me\s+(?:the\s+|some\s+)?|tell\s+me\s+(?:the\s+|some\s+)?|read\s+(?:me\s+)?(?:the\s+|some\s+)?|what'?s\s+(?:the\s+|new\s+(?:in\s+)?)?|i\s+want\s+|show\s+me\s+(?:the\s+|some\s+)?)?"
+                    + cat_group + r"\s+(?:news|headlines?|stories|update)"
+                    r"\s*[?.!]*$"
+                ),
+                handler="_fp_category",
+            ),
+            FastPathPattern(
+                id="get_news.bare",
+                description="Bypass LLM for bare news requests ('what's in the news')",
+                example="what's in the news",
+                regex=(
+                    r"^\s*(?:"
+                    r"what'?s\s+(?:in\s+the\s+|new\s+in\s+(?:the\s+)?|the\s+)?news"
+                    r"|news(?:\s+(?:please|update|briefing))?"
+                    r"|give\s+me\s+(?:the\s+|some\s+)?(?:headlines?|news)"
+                    r"|tell\s+me\s+(?:the\s+)?(?:headlines?|news)"
+                    r"|read\s+(?:me\s+)?(?:the\s+)?(?:headlines?|news)"
+                    r"|i\s+want\s+(?:the\s+|some\s+)?news"
+                    r"|what'?s\s+happening"
+                    r"|current\s+events"
+                    r"|headlines?"
+                    r")\s*[?.!]*$"
+                ),
+                handler="_fp_bare",
+            ),
+        ]
+
+    @staticmethod
+    def _parse_count(token: str) -> int | None:
+        token = token.lower().strip()
+        if token.isdigit():
+            return int(token)
+        return _SPOKEN_NUMBERS.get(token)
+
+    def _fp_count_category(self, match, voice_command: str) -> PreRouteResult | None:
+        count = self._parse_count(match.group("count"))
+        if count is None or count <= 0:
+            return None
+        return PreRouteResult(arguments={
+            "category": match.group("category").lower(),
+            "count": count,
+        })
+
+    def _fp_count_only(self, match, voice_command: str) -> PreRouteResult | None:
+        count = self._parse_count(match.group("count"))
+        if count is None or count <= 0:
+            return None
+        return PreRouteResult(arguments={"count": count})
+
+    def _fp_category(self, match, voice_command: str) -> PreRouteResult | None:
+        return PreRouteResult(arguments={"category": match.group("category").lower()})
+
+    def _fp_bare(self, match, voice_command: str) -> PreRouteResult | None:
+        return PreRouteResult(arguments={})
 
     # ------------------------------------------------------------------
     # Execution
