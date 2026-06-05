@@ -8,7 +8,7 @@ proactive awareness of current events during voice conversations.
 """
 
 import hashlib
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 try:
@@ -113,39 +113,33 @@ class NewsAlertAgent(IJarvisAgent):
             self._alerts = []
 
             if new_articles:
-                # One LLM call for the whole batch: the model filters AND
-                # composes the notifications, grouping related stories where
-                # appropriate. With a filter set, this replaces N per-article
-                # calls; without, we short-circuit to one notification per
-                # article (preserves the "tell me every new headline" UX
-                # without burning a model call to confirm it).
                 filter_text = self._read_filter()
-                if filter_text:
-                    notifications = self._compose_notifications(
-                        filter_text, new_articles
-                    )
-                else:
-                    notifications = [
-                        {
-                            "title": f"News: {a.get('title', '')[:80]}",
-                            "body": a.get("summary", "")[:200] or a.get("title", ""),
-                        }
-                        for a in new_articles
-                    ]
 
-                for n in notifications:
-                    self._push_notification(n["title"], n["body"])
+                # Filter is a HARD constraint when set. Two-stage to keep
+                # composition deterministic and the LLM honest: stage 1 picks
+                # matching articles (indices only), stage 2 builds the
+                # notification copy locally without LLM creativity drift.
+                if filter_text:
+                    matched = self._filter_articles(filter_text, new_articles)
+                else:
+                    matched = new_articles
+
+                # One notification per run regardless of headline count.
+                if matched:
+                    title, body, summary = self._compose_aggregate(matched)
+                    self._push_notification(title, body)
                     self._alerts.append(Alert(
                         source_agent=self.name,
-                        title=n["title"],
-                        summary=n["body"],
+                        title=title,
+                        summary=summary,
                         priority=1,
                     ))
 
                 logger.info(
                     "News agent processed new articles",
                     new_articles=len(new_articles),
-                    notifications=len(self._alerts),
+                    matched=len(matched),
+                    notifications_sent=1 if matched else 0,
                 )
 
             self._previous_titles = current_titles
@@ -212,19 +206,21 @@ class NewsAlertAgent(IJarvisAgent):
             logger.warning("Failed to read NOTIFICATION_FILTER", error=str(e))
             return ""
 
-    def _compose_notifications(
+    def _filter_articles(
         self, filter_text: str, articles: List[Dict[str, Any]]
-    ) -> List[Dict[str, str]]:
-        """Ask the LLM to filter + compose notifications for a batch.
+    ) -> List[Dict[str, Any]]:
+        """Ask the LLM which articles match the user's rule. Returns subset.
 
-        One LLM call for the whole batch. The model decides which articles
-        match the user's rule AND writes the notification copy (title + body),
-        grouping related stories where appropriate. Returns a list of
-        ``{"title": ..., "body": ...}`` dicts ready to push.
+        Single LLM call returning only matching article numbers — keeps the
+        decision deterministic to verify and prevents the model from
+        rewriting/embellishing headlines or smuggling in non-matching items
+        through composition.
 
-        Fail-open contract: on any LLM/parse error we fall back to one
-        notification per input article with raw title/summary copy — the
-        user keeps getting headlines, just without the filter applied.
+        Fail-CLOSED contract: when a filter is set and we can't reliably
+        determine matches (LLM unreachable, malformed output, no parseable
+        indices), we return [] rather than spamming irrelevant alerts. The
+        next run will retry. The user explicitly asked to be filtered — we
+        respect that even when the model is broken.
         """
         import json as _json
         import re
@@ -232,44 +228,49 @@ class NewsAlertAgent(IJarvisAgent):
         try:
             from services.node_llm_client import ask_llm
         except ImportError:
-            ask_llm = None  # type: ignore[assignment]
+            logger.warning("News filter: ask_llm unavailable; skipping run (fail-closed)")
+            return []
 
-        def _fallback() -> List[Dict[str, str]]:
-            return [
-                {
-                    "title": f"News: {a.get('title', '')[:80]}",
-                    "body": (a.get("summary", "") or a.get("title", ""))[:200],
-                }
-                for a in articles
-            ]
-
-        if ask_llm is None or not articles:
-            return _fallback() if articles else []
+        if not articles:
+            return []
 
         article_lines = []
         for i, a in enumerate(articles, start=1):
             article_lines.append(
                 f"{i}. {a.get('title', '').strip()}\n"
-                f"   {a.get('summary', '').strip()[:300]}\n"
-                f"   Source: {a.get('source', '').strip()}"
+                f"   {a.get('summary', '').strip()[:300]}"
             )
 
-        prompt = (
-            "You are a personal news notification curator. The user has set "
-            "this rule for when they want to be notified:\n\n"
-            f"{filter_text}\n\n"
-            f"Here are {len(articles)} new articles from today's feeds:\n\n"
-            + "\n\n".join(article_lines) +
-            "\n\nCompose the notifications the user should receive based on "
-            "their rule. Skip articles that don't match. Group closely "
-            "related stories into one notification when it improves clarity. "
-            "Each notification has a short title (under 80 chars) and a one- "
-            "to two-sentence body. If nothing matches, return an empty array.\n\n"
-            "Respond with ONLY a JSON array, no other text, in this exact "
-            'shape: [{"title": "...", "body": "..."}, ...]'
+        system = (
+            "You are a strict news filter. Your only job is to identify which "
+            "articles match the user's rule. Treat the rule as a HARD "
+            "constraint:\n"
+            "- Match only articles that CLEARLY and DIRECTLY satisfy the rule.\n"
+            "- Tangential, adjacent, or 'kind of related' articles do NOT match.\n"
+            "- When in doubt, SKIP the article. The cost of a false negative "
+            "(missing one match) is much lower than a false positive (sending "
+            "an irrelevant alert the user explicitly asked not to receive).\n"
+            "- Do NOT rewrite, summarize, or compose anything. Output ONLY a "
+            "JSON array of the matching article numbers."
         )
 
-        raw = ask_llm(prompt) or ""
+        prompt = (
+            f'The user\'s rule:\n"""\n{filter_text}\n"""\n\n'
+            f"Articles ({len(articles)} total):\n\n"
+            + "\n\n".join(article_lines) +
+            "\n\nReturn the numbers of articles that match the rule, as a JSON "
+            'array. Example: [1, 4, 7]. If nothing matches, return: []. '
+            "Output ONLY the array — no prose, no code fences, no explanation."
+        )
+
+        raw = ask_llm(prompt, system=system) or ""
+        if not raw:
+            logger.warning(
+                "News filter: empty LLM response; skipping run (fail-closed)",
+                article_count=len(articles),
+            )
+            return []
+
         # Strip <think>...</think> blocks (thinking-mode models)
         cleaned = re.sub(
             r"<think>.*?</think>", "", raw, flags=re.DOTALL | re.IGNORECASE
@@ -278,31 +279,79 @@ class NewsAlertAgent(IJarvisAgent):
         if cleaned.startswith("```"):
             cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
             cleaned = re.sub(r"\s*```$", "", cleaned)
-        # Find the first JSON array — models sometimes prepend a sentence
-        match = re.search(r"\[.*\]", cleaned, re.DOTALL)
+        # Find the first JSON array
+        match = re.search(r"\[[^\[\]]*\]", cleaned, re.DOTALL)
         if match:
             cleaned = match.group(0)
 
         try:
             parsed = _json.loads(cleaned)
             if not isinstance(parsed, list):
-                raise ValueError("expected a JSON array")
-            result: List[Dict[str, str]] = []
-            for item in parsed:
-                if not isinstance(item, dict):
-                    continue
-                title = str(item.get("title", "")).strip()
-                body = str(item.get("body", "")).strip()
-                if title:
-                    result.append({"title": title[:200], "body": (body or title)[:500]})
-            return result
+                raise ValueError("expected a JSON array of indices")
         except Exception as e:
             logger.warning(
-                "News compose parse failed; failing open",
+                "News filter: parse failed; skipping run (fail-closed)",
                 error=str(e),
-                raw=cleaned[:200],
+                raw=raw[:200],
             )
-            return _fallback()
+            return []
+
+        matched: List[Dict[str, Any]] = []
+        for idx in parsed:
+            try:
+                i = int(idx)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= i <= len(articles):
+                matched.append(articles[i - 1])
+
+        logger.info(
+            "News filter applied",
+            input_articles=len(articles),
+            matched=len(matched),
+        )
+        return matched
+
+    def _compose_aggregate(
+        self, articles: List[Dict[str, Any]]
+    ) -> tuple[str, str, str]:
+        """Build (push_title, push_body, tts_summary) from N matching articles.
+
+        Deterministic, no LLM. Always emits exactly one notification per call.
+        Body uses bullet-prefixed newline-separated headlines (renders well
+        in both push notifications and the inbox). TTS summary uses periods
+        for natural sentence pacing when the alert is read aloud.
+        """
+        n = len(articles)
+        if n == 1:
+            a = articles[0]
+            title = f"News: {a.get('title', '').strip()[:80]}"
+            body_text = (a.get("summary", "") or a.get("title", "")).strip()[:500]
+            return title, body_text, body_text
+
+        # 2+ matched articles → one aggregated notification.
+        titles = [a.get("title", "").strip() for a in articles if a.get("title")]
+        title = f"{n} news headlines"
+
+        # Push/inbox body: bullet list. Truncate to a soft cap so push
+        # notifications don't get cut off mid-headline.
+        bullets: List[str] = []
+        BODY_CAP = 500
+        used = 0
+        for t in titles:
+            line = f"• {t}"
+            if used + len(line) + 1 > BODY_CAP:
+                remaining = len(titles) - len(bullets)
+                if remaining > 0:
+                    bullets.append(f"…and {remaining} more")
+                break
+            bullets.append(line)
+            used += len(line) + 1
+        body = "\n".join(bullets)
+
+        # TTS summary: period-separated for sentence pacing. No bullets.
+        summary = f"{n} new headlines: " + ". ".join(titles) + "."
+        return title, body, summary[:500]
 
     def _push_notification(self, title: str, body: str) -> None:
         """Send a household-wide push notification via CC's relay endpoint.
