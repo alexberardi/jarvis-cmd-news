@@ -24,7 +24,7 @@ except ImportError:
         def error(self, msg: str, **kw: object) -> None: self._log.error(msg)
         def debug(self, msg: str, **kw: object) -> None: self._log.debug(msg)
 
-from jarvis_command_sdk import IJarvisAgent, AgentSchedule, Alert
+from jarvis_command_sdk import IJarvisAgent, AgentSchedule, Alert, JarvisSecret
 from jarvis_command_sdk import IJarvisSecret
 
 logger = JarvisLogger(service="jarvis-node")
@@ -59,7 +59,21 @@ class NewsAlertAgent(IJarvisAgent):
 
     @property
     def required_secrets(self) -> List[IJarvisSecret]:
-        return []
+        return [
+            JarvisSecret(
+                key="NOTIFICATION_FILTER",
+                description=(
+                    "Free-text instructions for when to send news alerts "
+                    "(e.g. 'only sports news', 'tech and finance only'). "
+                    "Leave blank to receive alerts for every new article."
+                ),
+                scope="integration",
+                value_type="string",
+                required=False,
+                is_sensitive=False,
+                friendly_name="Notification Filter",
+            ),
+        ]
 
     @property
     def include_in_context(self) -> bool:
@@ -92,24 +106,50 @@ class NewsAlertAgent(IJarvisAgent):
 
             # Detect new articles
             new_titles = current_titles - self._previous_titles
-            now = datetime.now(timezone.utc)
+            new_articles = [
+                a for a in articles
+                if a.get("title", "").strip().lower() in new_titles
+            ]
             self._alerts = []
 
-            for article in articles:
-                title = article.get("title", "")
-                if title.strip().lower() in new_titles:
+            if new_articles:
+                # One LLM call for the whole batch: the model filters AND
+                # composes the notifications, grouping related stories where
+                # appropriate. With a filter set, this replaces N per-article
+                # calls; without, we short-circuit to one notification per
+                # article (preserves the "tell me every new headline" UX
+                # without burning a model call to confirm it).
+                filter_text = self._read_filter()
+                if filter_text:
+                    notifications = self._compose_notifications(
+                        filter_text, new_articles
+                    )
+                else:
+                    notifications = [
+                        {
+                            "title": f"News: {a.get('title', '')[:80]}",
+                            "body": a.get("summary", "")[:200] or a.get("title", ""),
+                        }
+                        for a in new_articles
+                    ]
+
+                for n in notifications:
+                    self._push_notification(n["title"], n["body"])
                     self._alerts.append(Alert(
                         source_agent=self.name,
-                        title=title,
-                        summary=article.get("summary", "")[:200],
+                        title=n["title"],
+                        summary=n["body"],
                         priority=1,
                     ))
 
+                logger.info(
+                    "News agent processed new articles",
+                    new_articles=len(new_articles),
+                    notifications=len(self._alerts),
+                )
+
             self._previous_titles = current_titles
             self._current_articles = articles
-
-            if self._alerts:
-                logger.info("News agent found new articles", count=len(self._alerts))
 
             # Inject all current headlines into CC memory
             self._inject_memories(articles)
@@ -160,6 +200,140 @@ class NewsAlertAgent(IJarvisAgent):
                     "News agent injected memories",
                     count=result.get("injected", 0) + result.get("updated", 0),
                 )
+
+    def _read_filter(self) -> str:
+        """Return the user's NOTIFICATION_FILTER value (empty string if unset)."""
+        try:
+            from services.secret_service import get_secret_value
+            return (get_secret_value("NOTIFICATION_FILTER", "integration") or "").strip()
+        except ImportError:
+            return ""
+        except Exception as e:
+            logger.warning("Failed to read NOTIFICATION_FILTER", error=str(e))
+            return ""
+
+    def _compose_notifications(
+        self, filter_text: str, articles: List[Dict[str, Any]]
+    ) -> List[Dict[str, str]]:
+        """Ask the LLM to filter + compose notifications for a batch.
+
+        One LLM call for the whole batch. The model decides which articles
+        match the user's rule AND writes the notification copy (title + body),
+        grouping related stories where appropriate. Returns a list of
+        ``{"title": ..., "body": ...}`` dicts ready to push.
+
+        Fail-open contract: on any LLM/parse error we fall back to one
+        notification per input article with raw title/summary copy — the
+        user keeps getting headlines, just without the filter applied.
+        """
+        import json as _json
+        import re
+
+        try:
+            from services.node_llm_client import ask_llm
+        except ImportError:
+            ask_llm = None  # type: ignore[assignment]
+
+        def _fallback() -> List[Dict[str, str]]:
+            return [
+                {
+                    "title": f"News: {a.get('title', '')[:80]}",
+                    "body": (a.get("summary", "") or a.get("title", ""))[:200],
+                }
+                for a in articles
+            ]
+
+        if ask_llm is None or not articles:
+            return _fallback() if articles else []
+
+        article_lines = []
+        for i, a in enumerate(articles, start=1):
+            article_lines.append(
+                f"{i}. {a.get('title', '').strip()}\n"
+                f"   {a.get('summary', '').strip()[:300]}\n"
+                f"   Source: {a.get('source', '').strip()}"
+            )
+
+        prompt = (
+            "You are a personal news notification curator. The user has set "
+            "this rule for when they want to be notified:\n\n"
+            f"{filter_text}\n\n"
+            f"Here are {len(articles)} new articles from today's feeds:\n\n"
+            + "\n\n".join(article_lines) +
+            "\n\nCompose the notifications the user should receive based on "
+            "their rule. Skip articles that don't match. Group closely "
+            "related stories into one notification when it improves clarity. "
+            "Each notification has a short title (under 80 chars) and a one- "
+            "to two-sentence body. If nothing matches, return an empty array.\n\n"
+            "Respond with ONLY a JSON array, no other text, in this exact "
+            'shape: [{"title": "...", "body": "..."}, ...]'
+        )
+
+        raw = ask_llm(prompt) or ""
+        # Strip <think>...</think> blocks (thinking-mode models)
+        cleaned = re.sub(
+            r"<think>.*?</think>", "", raw, flags=re.DOTALL | re.IGNORECASE
+        ).strip()
+        # Strip markdown code fences if the model added them
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+        # Find the first JSON array — models sometimes prepend a sentence
+        match = re.search(r"\[.*\]", cleaned, re.DOTALL)
+        if match:
+            cleaned = match.group(0)
+
+        try:
+            parsed = _json.loads(cleaned)
+            if not isinstance(parsed, list):
+                raise ValueError("expected a JSON array")
+            result: List[Dict[str, str]] = []
+            for item in parsed:
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title", "")).strip()
+                body = str(item.get("body", "")).strip()
+                if title:
+                    result.append({"title": title[:200], "body": (body or title)[:500]})
+            return result
+        except Exception as e:
+            logger.warning(
+                "News compose parse failed; failing open",
+                error=str(e),
+                raw=cleaned[:200],
+            )
+            return _fallback()
+
+    def _push_notification(self, title: str, body: str) -> None:
+        """Send a household-wide push notification via CC's relay endpoint.
+
+        Caller owns the title/body copy verbatim — no auto-prefix, since
+        notifications composed by the LLM already include any "News:" /
+        category framing the user wants.
+        """
+        try:
+            from clients.rest_client import RestClient
+            from utils.service_discovery import get_command_center_url
+        except ImportError:
+            return
+
+        cc_url = get_command_center_url()
+        if not cc_url:
+            return
+
+        try:
+            RestClient.post(
+                f"{cc_url.rstrip('/')}/api/v0/node/push-notification",
+                data={
+                    "title": title[:200],
+                    "body": (body or title)[:500],
+                    "priority": "default",
+                    "category": "news",
+                },
+                timeout=5,
+            )
+        except Exception as e:
+            logger.warning("News push failed", title=title[:80], error=str(e))
 
     def get_context_data(self) -> Dict[str, Any]:
         return {}
