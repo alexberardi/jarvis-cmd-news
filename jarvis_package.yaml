@@ -1,7 +1,7 @@
 name: "get_news"
 display_name: "News Headlines"
 description: "Get the latest news headlines by category via RSS feeds. Supports general, tech, sports, business, science, and health. Includes background agent for new article alerts."
-version: "1.4.1"
+version: "1.4.2"
 min_jarvis_version: "0.1.4"
 license: "MIT"
 author:

@@ -51,7 +51,7 @@ def test_message_composed_when_pre_routed(cmd_module, monkeypatch):
     assert "Headline 1" in resp.context_data["message"]
 
 
-def test_no_message_when_not_pre_routed(cmd_module, monkeypatch):
+def test_message_present_even_when_not_pre_routed(cmd_module, monkeypatch):
     cmd = cmd_module.NewsCommand()
     monkeypatch.setattr(cmd, "_fetch_articles", lambda urls: _stub_articles(2))
 
@@ -63,8 +63,11 @@ def test_no_message_when_not_pre_routed(cmd_module, monkeypatch):
         is_pre_routed=False,
     )
     resp = cmd.run(req)
-    # On the LLM path, no message — CC will compose from structured articles
-    assert resp.context_data.get("message") is None
+    # The message is now composed unconditionally so the command-center voice
+    # fast-path speaks it directly instead of re-formatting via the LLM (which
+    # risked generic filler like "Task completed.").
+    assert resp.context_data.get("message"), "expected a composed message on the LLM path too"
+    assert "Headline 1" in resp.context_data["message"]
 
 
 def test_compose_no_articles(cmd_module):

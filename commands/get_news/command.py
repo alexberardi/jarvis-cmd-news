@@ -301,12 +301,12 @@ class NewsCommand(IJarvisCommand):
             "count": len(articles),
             "articles": articles,
         }
-        # Pre-route callers have no LLM downstream — pre-compose a spoken
-        # summary from the headlines. Without this, the wrapper sees no
-        # `message` and falls through to the LLM path, defeating the
-        # fast-path entirely (see command_execution_service.py:914-922).
-        if request_info.is_pre_routed:
-            context_data["message"] = _compose_news_message(articles, category)
+        # Always pre-compose a spoken summary from the headlines so the
+        # command-center voice fast-path speaks it directly. Without a
+        # `message` the wrapper falls through to the LLM formatting path,
+        # which risks generic filler like "Task completed."
+        # (see command_execution_service.py:914-922).
+        context_data["message"] = _compose_news_message(articles, category)
 
         return CommandResponse.success_response(
             context_data=context_data,
