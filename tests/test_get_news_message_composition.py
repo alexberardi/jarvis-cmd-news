@@ -39,7 +39,7 @@ def test_message_composed_when_pre_routed(cmd_module, monkeypatch):
     # Mock _fetch_articles so we don't hit real RSS feeds
     monkeypatch.setattr(cmd, "_fetch_articles", lambda urls: _stub_articles(3))
 
-    from core.request_information import RequestInformation
+    from jarvis_command_sdk import RequestInformation
     req = RequestInformation(
         voice_command="news",
         conversation_id="c",
@@ -55,7 +55,7 @@ def test_message_present_even_when_not_pre_routed(cmd_module, monkeypatch):
     cmd = cmd_module.NewsCommand()
     monkeypatch.setattr(cmd, "_fetch_articles", lambda urls: _stub_articles(2))
 
-    from core.request_information import RequestInformation
+    from jarvis_command_sdk import RequestInformation
     req = RequestInformation(
         voice_command="news",
         conversation_id="c",
